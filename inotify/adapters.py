@@ -318,8 +318,13 @@ class _BaseTree(object):
                         _LOGGER.debug("A directory has been renamed. We're "
                                       "adding a watch on it (because we're "
                                       "being recursive): [%s]", full_path)
-
-                        self._i.add_watch(full_path, self._mask)
+                        try:
+                            self._i.add_watch(full_path, self._mask)
+                        except inotify.calls.InotifyError as e:
+                            if e.errno == ENOENT:
+                                _LOGGER.warning("Path %s disappeared before we could watch it", full_path)
+                            else:
+                                raise
 
             yield event
 
