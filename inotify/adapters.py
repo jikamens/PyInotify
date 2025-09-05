@@ -93,13 +93,24 @@ class Inotify(object):
         path_bytes = path_unicode.encode('utf8')
 
         wd = inotify.calls.inotify_add_watch(self.__inotify_fd, path_bytes, mask)
-        _LOGGER.debug("Added watch (%d): [%s]", wd, path_unicode)
+        try:
+            old_path = self.__watches_r.pop(wd)
+        except KeyError:
+            _LOGGER.debug("Added watch (%d): [%s]", wd, path_unicode)
+        else:
+            # Already watched under a different path
+            self.__watches.pop(old_path)
+            _LOGGER.debug("Watch (%d) moved from %s to %s",
+                          wd, old_path, path_unicode)
 
         self.__watches[path_unicode] = wd
         self.__watches_r[wd] = path_unicode
 
         return wd
 
+    def watches(self):
+        return self.__watches.keys()
+            
     def remove_watch(self, path, superficial=False):
         """Remove our tracking information and call inotify to stop watching
         the given path. When a directory is removed, we'll just have to remove
@@ -182,6 +193,8 @@ class Inotify(object):
             path = self.__watches_r.get(header.wd)
             if path is not None:
                 filename_unicode = filename_bytes.decode('utf8')
+                if filename_unicode:
+                    _LOGGER.debug(f"Event filename received for {path}: {filename_unicode}")
                 yield (header, type_names, path, filename_unicode)
 
             buffer_length = len(self.__buffer)
@@ -270,6 +283,17 @@ class _BaseTree(object):
         self._i = Inotify(block_duration_s=block_duration_s)
         self._follow_symlinks = follow_symlinks
 
+    def remove_tree(self, path):
+        path = path.rstrip(os.path.sep)
+        _LOGGER.debug("Removing all watches beneath %s", path)
+        prefix = path + os.path.sep
+        # Accumulate all paths to remove before removing any to avoid messing
+        # with the data while we're iterating through it.
+        to_remove = [p for p in self._i.watches()
+                     if p == path or p.startswith(prefix)]
+        for watch_path in to_remove:
+            self._i.remove_watch(watch_path)
+            
     def event_gen(self, ignore_missing_new_folders=False, **kwargs):
         """This is a secondary generator that wraps the principal one, and
         adds/removes watches as directories are added/removed.
@@ -279,17 +303,25 @@ class _BaseTree(object):
         `ignore_missing_new_folders`.
         """
 
+        user_yield_nones = kwargs.get('yield_nones', True)
+        kwargs['yield_nones'] = True
+        move_from_events = {}
+
         for event in self._i.event_gen(**kwargs):
-            if event is not None:
+            if event is None:
+                if move_from_events:
+                    _LOGGER.debug("Handling deferred MOVED_FROM events")
+                    for move_event in move_from_events.values():
+                        (header, type_names, path, filename) = move_event
+                        self.remove_tree(os.path.join(path, filename))
+                    move_from_events = {}
+            else:
                 (header, type_names, path, filename) = event
 
                 if header.mask & inotify.constants.IN_ISDIR:
                     full_path = os.path.join(path, filename)
 
-                    if (
-                        (header.mask & inotify.constants.IN_MOVED_TO) or
-                        (header.mask & inotify.constants.IN_CREATE)
-                       ) and \
+                    if header.mask & inotify.constants.IN_CREATE and \
                        (
                         os.path.exists(full_path) is True or
                         ignore_missing_new_folders is False
@@ -297,11 +329,9 @@ class _BaseTree(object):
                         _LOGGER.debug("A directory has been created. We're "
                                       "adding a watch on it (because we're "
                                       "being recursive): [%s]", full_path)
-
-
                         self._load_tree(full_path)
 
-                    if header.mask & inotify.constants.IN_DELETE:
+                    elif header.mask & inotify.constants.IN_DELETE:
                         _LOGGER.debug("A directory has been removed. We're "
                                       "being recursive, but it would have "
                                       "automatically been deregistered: [%s]",
@@ -309,26 +339,81 @@ class _BaseTree(object):
 
                         # The watch would've already been cleaned-up internally.
                         self._i.remove_watch(full_path, superficial=True)
+
+                    # If a subdirectory of a directory we're watching is moved,
+                    # then there are two scenarios we need to handle:
+                    #
+                    # 1) If it has been moved out of the directory tree we're
+                    #    watching, then we will get only the IN_MOVED_FROM
+                    #    event for it. In this case we need to remove our watch
+                    #    on the moved directory and on all of the directories
+                    #    underneath it. We won't get separate events for those!
+                    # 2) If it has been moved somewhere else within the
+                    #    tree we're watching, then we'll get both IN_MOVED_FROM
+                    #    and IN_MOVED_TO events for it. In this case our
+                    #    existing watches on the directory and its
+                    #    subdirectories will remain open, but they have new
+                    #    paths now so we need to update our internal data to
+                    #    match the new paths. This is handled in _load_tree.
+                    #
+                    # Challenge: when we get the IN_MOVED_FROM event, how we
+                    # handle it depends on whether there is a subsequent
+                    # IN_MOVED_TO event! We don't want to remove all the
+                    # watches if this is an in-tree move, both because it's
+                    # inefficient to delete and then soon after recreate those
+                    # watches, and because it creates a race condition: if
+                    # something happens in one of the directories between when
+                    # we remove the watches and when we recreate them, we won't
+                    # get notified about it.
+                    #
+                    # We solve this by waiting to handle the IN_MOVED_FROM
+                    # event until we get a None from the primary event_gen
+                    # generator. It is reasonable to assume that linked
+                    # IN_MOVED_FROM and IN_MOVED_TO events will arrive in a
+                    # single batch of events. If there are pending
+                    # IN_MOVED_FROM events at the end of the batch, then we
+                    # assume they were moved out of tree and remove all the
+                    # corresponding watches.
+                    #
+                    # There's also a third scenario we need to handle below. If
+                    # we get an IN_MOVED_TO without a corresponding
+                    # IN_MOVED_FROM, then the directory was moved into our tree
+                    # from outside our tree, so we need to add watches for that
+                    # whole subtree.
                     elif header.mask & inotify.constants.IN_MOVED_FROM:
-                        _LOGGER.debug("A directory has been renamed. We're "
-                                      "being recursive, but it would have "
-                                      "automatically been deregistered: [%s]",
-                                      full_path)
-
-                        self._i.remove_watch(full_path, superficial=True)
+                        _LOGGER.debug(
+                            "A directory has been renamed. Deferring "
+                            "handling until we find out whether the target is "
+                            "in our tree: [%s]", full_path)
+                        move_from_events[header.cookie] = event
                     elif header.mask & inotify.constants.IN_MOVED_TO:
-                        _LOGGER.debug("A directory has been renamed. We're "
-                                      "adding a watch on it (because we're "
-                                      "being recursive): [%s]", full_path)
                         try:
-                            self._i.add_watch(full_path, self._mask)
-                        except inotify.calls.InotifyError as e:
-                            if e.errno == ENOENT:
-                                _LOGGER.warning("Path %s disappeared before we could watch it", full_path)
-                            else:
-                                raise
+                            from_event = move_from_events.pop(header.cookie)
+                        except KeyError:
+                            _LOGGER.debug(
+                                "A directory has been moved into our watch "
+                                "area. Adding watches for it and its "
+                                "subdirectories: [%s]", full_path)
+                            self._load_tree(full_path)
+                        else:
+                            (_, _, from_path, from_filename) = from_event
+                            full_from_path = os.path.join(
+                                from_path, from_filename)
+                            _LOGGER.debug(
+                                "A directory has been moved from %s to %s "
+                                "within our watch area. Updating internal "
+                                "data to reflect move.", full_from_path,
+                                full_path)
+                            self._load_tree(full_path)
+                            # If part of the _load_tree above fails in part or
+                            # in full because the top-level directory or some
+                            # of its subdirectories have been removed, then
+                            # they won't get cleaned up by _load_tree, so let's
+                            # clean them up just in case.
+                            self.remove_tree(full_from_path)
 
-            yield event
+            if user_yield_nones or event is not None:
+                yield event
 
     @property
     def inotify(self):
