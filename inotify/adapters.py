@@ -257,7 +257,8 @@ class Inotify(object):
 
 class _BaseTree(object):
     def __init__(self, mask=inotify.constants.IN_ALL_EVENTS,
-                 block_duration_s=_DEFAULT_EPOLL_BLOCK_DURATION_S):
+                 block_duration_s=_DEFAULT_EPOLL_BLOCK_DURATION_S,
+                 follow_symlinks=False):
 
         # No matter what we actually received as the mask, make sure we have
         # the minimum that we require to curate our list of watches.
@@ -267,6 +268,7 @@ class _BaseTree(object):
                         inotify.constants.IN_DELETE
 
         self._i = Inotify(block_duration_s=block_duration_s)
+        self._follow_symlinks = follow_symlinks
 
     def event_gen(self, ignore_missing_new_folders=False, **kwargs):
         """This is a secondary generator that wraps the principal one, and
@@ -342,19 +344,17 @@ class _BaseTree(object):
             del q[0]
 
             try:
-                filenames = os.listdir(current_path)
+                direntries = os.scandir(current_path)
             except FileNotFoundError:
                 _LOGGER.warning("Path %s disappeared before we could list it", current_path)
                 continue
                 
             paths.append(current_path)
 
-            for filename in filenames:
-                entry_filepath = os.path.join(current_path, filename)
-                if os.path.isdir(entry_filepath) is False:
+            for direntry in direntries:
+                if not direntry.is_dir(follow_symlinks=self._follow_symlinks):
                     continue
-
-                q.append(entry_filepath)
+                q.append(direntry.path)
 
         for path in paths:
             try:
@@ -370,8 +370,11 @@ class InotifyTree(_BaseTree):
     """Recursively watch a path."""
 
     def __init__(self, path, mask=inotify.constants.IN_ALL_EVENTS,
-                 block_duration_s=_DEFAULT_EPOLL_BLOCK_DURATION_S):
-        super(InotifyTree, self).__init__(mask=mask, block_duration_s=block_duration_s)
+                 block_duration_s=_DEFAULT_EPOLL_BLOCK_DURATION_S,
+                 follow_symlinks=False):
+        super(InotifyTree, self).__init__(
+            mask=mask, block_duration_s=block_duration_s,
+            follow_symlinks=follow_symlinks)
 
         self._load_tree(path)
 
@@ -384,8 +387,11 @@ class InotifyTrees(_BaseTree):
     """Recursively watch over a list of trees."""
 
     def __init__(self, paths, mask=inotify.constants.IN_ALL_EVENTS,
-                 block_duration_s=_DEFAULT_EPOLL_BLOCK_DURATION_S):
-        super(InotifyTrees, self).__init__(mask=mask, block_duration_s=block_duration_s)
+                 block_duration_s=_DEFAULT_EPOLL_BLOCK_DURATION_S,
+                 follow_symlinks=False):
+        super(InotifyTrees, self).__init__(
+            mask=mask, block_duration_s=block_duration_s,
+            follow_symlinks=follow_symlinks)
 
         self._load_trees(paths)
 
